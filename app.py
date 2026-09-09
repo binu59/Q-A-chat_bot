@@ -8,16 +8,15 @@ from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.prompts import PromptTemplate
-from langchain_classic.chains import ConversationalRetrievalChain
-from langchain_classic.memory import ConversationBufferMemory
+
+from web_router import answer_question
+
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    st.error("GEMINI_API_KEY not found. Add it to your .env file.")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY not found. Add it to your .env file.")
     st.stop()
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -170,6 +169,21 @@ st.markdown("""
     cursor: pointer;
 }
 
+/* ── Web search badge ── */
+.dm-web-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 8px;
+    margin-left: 6px;
+    font-size: 11px;
+    color: #0C7A4B;
+    background: #E7F7EF;
+    border: 0.5px solid #B7E4CE;
+    border-radius: 20px;
+    padding: 3px 10px;
+}
+
 /* ── Suggestion chips ── */
 .dm-chips {
     display: flex;
@@ -232,7 +246,7 @@ def _load_pages(tmp_path):
 
 
 @st.cache_resource(show_spinner="🧠 Building knowledge base…")
-def build_rag_chain(file_hash: str, tmp_path: str):
+def build_retriever(file_hash: str, tmp_path: str):
     pages = _load_pages(tmp_path)
     chunks = RecursiveCharacterTextSplitter(
         chunk_size=1000, chunk_overlap=150,
@@ -243,58 +257,56 @@ def build_rag_chain(file_hash: str, tmp_path: str):
     vectorstore = Chroma.from_documents(chunks, embedding=embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite",
-        google_api_key=GEMINI_API_KEY,
-    )
-
     st.session_state.page_count = len(pages)
-
-    # Return retriever + llm only; memory lives in session state
-    return retriever, llm
+    return retriever
 
 
-def get_or_build_chain(file_hash, tmp_path):
-    retriever, llm = build_rag_chain(file_hash, tmp_path)
+def get_or_build_retriever(file_hash, tmp_path):
+    return build_retriever(file_hash, tmp_path)
 
-    # Recreate memory fresh per session (not cached)
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer",
-    )
 
-    qa_prompt = PromptTemplate.from_template(
-        "You are DocMind, a helpful AI assistant that answers questions about uploaded PDF documents.\n"
-        "Use the context below to answer as thoroughly as possible.\n"
-        "If the context doesn't fully cover the question, supplement with your general knowledge — but say so.\n"
-        "Never say 'I don't know' if you can give a partial or related answer.\n\n"
-        "Context:\n{context}\n\n"
-        "Question: {question}\n"
-        "Answer:"
-    )
-
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        return_source_documents=True,
-        combine_docs_chain_kwargs={"prompt": qa_prompt},
-    )
+# ── Chat history formatting ─────────────────────────────────────────────────────
+def format_chat_history(messages, max_turns: int = 4) -> str:
+    """Turns the last few session messages into plain text for the router prompt."""
+    recent = messages[-(max_turns * 2):]
+    lines = []
+    for m in recent:
+        role = "User" if m["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {m['content']}")
+    return "\n".join(lines)
 
 
 # ── Safe invoke ────────────────────────────────────────────────────────────────
-def safe_invoke(chain, question: str, max_retries: int = 3):
+def safe_answer(retriever, question: str, chat_history: str, max_retries: int = 3):
+    """
+    Retrieves PDF context, then runs it through the Groq router
+    (answer_question), which decides whether to pull in live web
+    results before generating the final answer.
+    """
     last_error = None
     for attempt in range(max_retries):
         try:
-            result = chain.invoke({"question": question})
-            return result["answer"], result.get("source_documents", []), None
+            docs = retriever.invoke(question)
+            pdf_context = "\n\n".join(doc.page_content for doc in docs)
+
+            result = answer_question(
+                question=question,
+                pdf_context=pdf_context,
+                chat_history=chat_history,
+            )
+
+            sources_data = [
+                {"page": doc.metadata.get("page", "?"), "content": doc.page_content}
+                for doc in docs
+            ]
+
+            return result["answer"], sources_data, result["used_web_search"], result["router_reason"], None
         except Exception as e:
             last_error = e
-            st.error(f"Attempt {attempt+1} failed: {type(e).__name__}: {e}")  # ← ADD THIS
+            st.error(f"Attempt {attempt + 1} failed: {type(e).__name__}: {e}")
             time.sleep(2 ** attempt)
-    return None, [], last_error
+    return None, [], False, "", last_error
+
 
 # ── PDF state helpers ──────────────────────────────────────────────────────────
 def _set_active_pdf(uploaded_file):
@@ -308,18 +320,19 @@ def _set_active_pdf(uploaded_file):
             tmp_path = tmp.name
         st.session_state.active_pdf_id = pdf_id
         st.session_state.active_pdf_name = uploaded_file.name
-        st.session_state.rag_chain = get_or_build_chain(file_hash, tmp_path)
-        st.session_state.messages = []  
+        st.session_state.retriever = get_or_build_retriever(file_hash, tmp_path)
+        st.session_state.messages = []
+
 
 def _clear_active_pdf():
-    for key in ["active_pdf_id", "active_pdf_name", "rag_chain", "page_count", "messages"]:
+    for key in ["active_pdf_id", "active_pdf_name", "retriever", "page_count", "messages"]:
         st.session_state.pop(key, None)
 
 
 # ── Sync PDF state ─────────────────────────────────────────────────────────────
 uploaded_file = st.session_state.get("pdf_uploader")
 if uploaded_file is None:
-    if "rag_chain" in st.session_state:
+    if "retriever" in st.session_state:
         _clear_active_pdf()
 else:
     _set_active_pdf(uploaded_file)
@@ -329,7 +342,7 @@ if "messages" not in st.session_state:
 
 
 # ── Header ─────────────────────────────────────────────────────────────────────
-has_pdf = "rag_chain" in st.session_state
+has_pdf = "retriever" in st.session_state
 page_count = st.session_state.get("page_count", 0)
 
 st.markdown(f"""
@@ -415,12 +428,17 @@ else:
             if pages_cited:
                 source_pill = f'<div class="dm-sources">📎 {len(pages_cited)} source(s) · page(s) {", ".join(sorted(pages_cited, key=int))}</div>'
 
+            web_badge = ""
+            if msg.get("used_web_search"):
+                web_badge = '<div class="dm-web-badge">🌐 Live web results</div>'
+
             st.markdown(f"""
             <div class="dm-msg-row">
               <div class="dm-avatar bot">🧠</div>
               <div>
                 <div class="dm-bubble bot">{msg["content"]}</div>
                 {source_pill}
+                {web_badge}
               </div>
             </div>
             """, unsafe_allow_html=True)
@@ -436,6 +454,8 @@ else:
 if has_pdf:
     if question := st.chat_input("Ask anything about your PDF…"):
 
+        chat_history = format_chat_history(st.session_state.messages)
+
         st.session_state.messages.append({"role": "user", "content": question})
 
         st.markdown(f"""
@@ -446,7 +466,9 @@ if has_pdf:
         """, unsafe_allow_html=True)
 
         with st.spinner("DocMind is thinking…"):
-            answer, source_docs, error = safe_invoke(st.session_state.rag_chain, question)
+            answer, sources_data, used_web_search, router_reason, error = safe_answer(
+                st.session_state.retriever, question, chat_history,
+            )
 
         if error is not None:
             err_msg = "⚠️ Something went wrong after 3 retries. Please try again in a moment."
@@ -457,13 +479,6 @@ if has_pdf:
                 "sources": [],
             })
         else:
-            sources_data = []
-            for doc in source_docs:
-                sources_data.append({
-                    "page": doc.metadata.get("page", "?"),
-                    "content": doc.page_content,
-                })
-
             pages_cited = list(set(
                 str(s["page"] + 1) for s in sources_data
                 if s.get("page") not in [None, "?"]
@@ -472,12 +487,17 @@ if has_pdf:
             if pages_cited:
                 source_pill = f'<div class="dm-sources">📎 {len(pages_cited)} source(s) · page(s) {", ".join(sorted(pages_cited, key=int))}</div>'
 
+            web_badge = ""
+            if used_web_search:
+                web_badge = '<div class="dm-web-badge">🌐 Live web results</div>'
+
             st.markdown(f"""
             <div class="dm-msg-row">
               <div class="dm-avatar bot">🧠</div>
               <div>
                 <div class="dm-bubble bot">{answer}</div>
                 {source_pill}
+                {web_badge}
               </div>
             </div>
             """, unsafe_allow_html=True)
@@ -493,6 +513,7 @@ if has_pdf:
                 "role": "assistant",
                 "content": answer,
                 "sources": sources_data,
+                "used_web_search": used_web_search,
             })
 
 else:

@@ -1,0 +1,29 @@
+[project]
+name = "q-a-chat-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Binu", email = "mewanyabinu@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "groq",
+    "langchain-chroma",
+    "langchain-community",
+    "langchain-huggingface",
+    "langchain-text-splitters",
+    "mcp",
+    "pypdf",
+    "protobuf>=6.31.1",
+    "python-dotenv",
+    "sentence-transformers",
+    "streamlit",
+]
+
+[project.scripts]
+q-a-chat-bot = "q_a_chat_bot:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
